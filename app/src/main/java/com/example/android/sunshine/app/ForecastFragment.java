@@ -17,10 +17,14 @@ package com.example.android.sunshine.app;
 
 import android.annotation.TargetApi;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Resources;
 import android.content.res.TypedArray;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -45,13 +49,27 @@ import android.view.ViewTreeObserver;
 import android.widget.AbsListView;
 import android.widget.TextView;
 
+import com.example.android.sunshine.app.data.WatchWeather;
 import com.example.android.sunshine.app.data.WeatherContract;
 import com.example.android.sunshine.app.sync.SunshineSyncAdapter;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.wearable.Asset;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.DataMap;
+import com.google.android.gms.wearable.PutDataMapRequest;
+import com.google.android.gms.wearable.PutDataRequest;
+import com.google.android.gms.wearable.Wearable;
+
+import java.io.ByteArrayOutputStream;
 
 /**
  * Encapsulates fetching the forecast and displaying it as a {@link android.support.v7.widget.RecyclerView} layout.
  */
-public class ForecastFragment extends Fragment implements LoaderManager.LoaderCallbacks<Cursor>, SharedPreferences.OnSharedPreferenceChangeListener {
+public class ForecastFragment extends Fragment implements LoaderManager.LoaderCallbacks<Cursor>,
+        SharedPreferences.OnSharedPreferenceChangeListener,
+        GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener {
+
     public static final String LOG_TAG = ForecastFragment.class.getSimpleName();
     private ForecastAdapter mForecastAdapter;
     private RecyclerView mRecyclerView;
@@ -59,7 +77,13 @@ public class ForecastFragment extends Fragment implements LoaderManager.LoaderCa
     private int mChoiceMode;
     private boolean mHoldForTransition;
     private long mInitialSelectedDate = -1;
-
+    private WatchWeather mWatchWeather;
+    private GoogleApiClient mGoogleClient;
+    // these indices must match the projection
+    private static final int INDEX_WEATHER_ID = 0;
+    private static final int INDEX_MAX_TEMP = 1;
+    private static final int INDEX_MIN_TEMP = 2;
+    private static final int INDEX_SHORT_DESC = 3;
     private static final String SELECTED_KEY = "selected_position";
 
     private static final int FORECAST_LOADER = 0;
@@ -115,6 +139,19 @@ public class ForecastFragment extends Fragment implements LoaderManager.LoaderCa
         super.onCreate(savedInstanceState);
         // Add this line in order for this fragment to handle menu events.
         setHasOptionsMenu(true);
+
+        //build a google cliet for the watch app
+        mGoogleClient = new GoogleApiClient.Builder(getActivity())
+                .addApi(Wearable.API)
+                .addConnectionCallbacks(this)
+                .addOnConnectionFailedListener(this)
+                .build();
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        mGoogleClient.connect();
     }
 
     @Override
@@ -129,6 +166,14 @@ public class ForecastFragment extends Fragment implements LoaderManager.LoaderCa
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(getActivity());
         sp.unregisterOnSharedPreferenceChangeListener(this);
         super.onPause();
+    }
+
+    @Override
+    public void onStop() {
+        if (null != mGoogleClient && mGoogleClient.isConnected()) {
+            mGoogleClient.disconnect();
+        }
+        super.onStop();
     }
 
     @Override
@@ -429,9 +474,105 @@ public class ForecastFragment extends Fragment implements LoaderManager.LoaderCa
     }
 
     @Override
+    public void onConnected(Bundle bundle) {
+        mWatchWeather = new WatchWeather();
+        storeInWatchWeather();
+        String WEARABLE_DATA_PATH = "/wearable_data";
+
+        Bitmap bitmap = BitmapFactory.decodeResource(getResources(),
+                Utility.getIconResourceForWeatherCondition(mWatchWeather.getIconId()));
+        Asset asset = createAssetFromBitmap(bitmap);
+
+        DataMap dataMap = new DataMap();
+        dataMap.putDouble("high", mWatchWeather.getHighTemp());
+        dataMap.putDouble("low", mWatchWeather.getLowTemp());
+        dataMap.putString("desc", mWatchWeather.getDesc());
+        dataMap.putAsset("icon", asset);
+
+        new SendToDataLayerThread(WEARABLE_DATA_PATH, dataMap).start();
+    }
+
+    @Override
+    public void onConnectionSuspended(int i) {
+
+    }
+
+    @Override
+    public void onConnectionFailed(ConnectionResult connectionResult) {
+
+    }
+
+    @Override
     public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
         if (key.equals(getString(R.string.pref_location_status_key))) {
             updateEmptyView();
+        }
+    }
+
+    private void storeInWatchWeather() {
+        Context context = getActivity();
+        String locationQuery = Utility.getPreferredLocation(context);
+
+        Uri weatherUri = WeatherContract.WeatherEntry.buildWeatherLocationWithDate(locationQuery, System.currentTimeMillis());
+
+        // we'll query our contentProvider, as always
+        Cursor cursor = context.getContentResolver().query(weatherUri,
+                SunshineSyncAdapter.NOTIFY_WEATHER_PROJECTION, null, null, null);
+
+        if (cursor != null) {
+            Log.d("mytag2", "cursor isnt null");
+            cursor.moveToFirst();
+            int weatherId = cursor.getInt(INDEX_WEATHER_ID);
+            double high = cursor.getDouble(INDEX_MAX_TEMP);
+            double low = cursor.getDouble(INDEX_MIN_TEMP);
+            String desc = cursor.getString(INDEX_SHORT_DESC);
+
+            int iconId = Utility.getIconResourceForWeatherCondition(weatherId);
+            Resources resources = context.getResources();
+            int artResourceId = Utility.getArtResourceForWeatherCondition(weatherId);
+            String artUrl = Utility.getArtUrlForWeatherCondition(context, weatherId);
+
+            //TODO: this is where I am sending it to the watch app first
+            Log.d("mytag2", "desc is : " + desc);
+            Log.d("mytag2", "hightemp is : " + high);
+            Log.d("mytag2", "low is : " + low);
+            Log.d("mytag2", "iconid is : " + iconId);
+            mWatchWeather.setDesc(desc);
+            mWatchWeather.setHighTemp(high);
+            mWatchWeather.setLowTemp(low);
+            mWatchWeather.setIconId(iconId);
+        } else {
+            Log.d("mytag2", "cursor is null");
+
+        }
+    }
+
+    private static Asset createAssetFromBitmap(Bitmap bitmap) {
+        final ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, byteStream);
+        return Asset.createFromBytes(byteStream.toByteArray());
+    }
+
+    private class SendToDataLayerThread extends Thread {
+        String path;
+        DataMap dataMap;
+
+        SendToDataLayerThread(String p, DataMap data) {
+            path = p;
+            dataMap = data;
+        }
+
+        public void run() {
+            PutDataMapRequest putDataMapRequest = PutDataMapRequest.create(path);
+            putDataMapRequest.getDataMap().putAll(dataMap);
+            PutDataRequest request = putDataMapRequest.asPutDataRequest();
+            DataApi.DataItemResult result = Wearable.DataApi.putDataItem(mGoogleClient, request).await();
+            if (result.getStatus().isSuccess()) {
+                Log.v("myTag2", "DataMap: " + dataMap + " sent successfully to data layer ");
+            } else {
+                // Log an error
+                Log.v("myTag2", "ERROR: failed to send DataMap to data layer");
+            }
         }
     }
 }
